@@ -93,7 +93,8 @@
 │  │                                                       │   │
 │  │  订阅 TF：                                            │   │
 │  │  • fr3_link0 → robotiq_85_base_link                  │   │
-│  │     └─ 获取当前末端执行器位姿                        │   │
+│  │     └─ 获取末端执行器相对于基坐标系 fr3_link0 的位姿│   │
+│  │        （通过 tf_buffer.lookup_transform() 查询）     │   │
 │  │                                                       │   │
 │  │  发布话题：                                           │   │
 │  │  • /moveit_servo/delta_twist_cmds (TwistStamped)    │   │
@@ -250,7 +251,121 @@ VR 控制器数据通过以下流程传递：
 
 - **VR 坐标系**：Y-up（Y 轴向上）
 - **ROS 坐标系**：Z-up（Z 轴向上）
-- 系统自动进行坐标转换
+- 系统中有两个坐标转换阶段
+
+#### 转换 1：vive_node.cpp 中的坐标转换（VR Y-up → ROS Z-up）
+
+**应用范围**：仅应用于发布到 TF 树和 `/vive_pose_abs`、`/vive_pose_rel` 话题的数据
+
+**注意**：`/controller_data` 话题中的位姿数据保持 VR 原始坐标系，不进行此转换。
+
+**坐标转换示意图**：
+```
+VR 坐标系 (Y-up)                    ROS 坐标系 (Z-up)
+┌─────────────┐                    ┌─────────────┐
+│      Y↑     │                    │      Z↑     │
+│      │      │                    │      │      │
+│      │      │                    │      │      │
+│      └──X→  │                    │      └──X→  │
+│     ╱       │                    │     ╱       │
+│    ╱        │                    │    ╱        │
+│   Z⊙        │                    │   Y⊙        │
+└─────────────┘                    └─────────────┘
+X: 右 → 前                         X: 前
+Y: 上 → 上                         Y: 左
+Z: 后 → 上                         Z: 上
+
+坐标轴映射关系：
+VR → ROS
+─────────────────────────────
+位置 (Translation):
+  VR.z (后)  → ROS.x (前)   [取反]
+  VR.x (右)  → ROS.y (左)   [取反]
+  VR.y (上)  → ROS.z (上)   [直接对应]
+
+旋转 (Quaternion):
+  VR.qz      → ROS.qx       [取反]
+  VR.qx      → ROS.qy       [取反]
+  VR.qy      → ROS.qz       [直接对应]
+  VR.qw      → ROS.qw       [直接对应]
+```
+
+**实现代码**（`vive_node.cpp` 的 `transformVRToROS()` 函数）：
+```cpp
+void transformVRToROS(const VRControllerData& vrData, 
+                      geometry_msgs::msg::TransformStamped& transform) {
+    // 位置转换：VR (Y-up) → ROS (Z-up)
+    transform.transform.translation.x = -vrData.pose_z;  // VR.z(后) → ROS.x(前)
+    transform.transform.translation.y = -vrData.pose_x;  // VR.x(右) → ROS.y(左)
+    transform.transform.translation.z = vrData.pose_y;   // VR.y(上) → ROS.z(上)
+    
+    // 旋转转换：四元数轴映射
+    transform.transform.rotation.x = -vrData.pose_qz;
+    transform.transform.rotation.y = -vrData.pose_qx;
+    transform.transform.rotation.z = vrData.pose_qy;
+    transform.transform.rotation.w = vrData.pose_qw;
+}
+```
+
+#### 转换 2：fr3_vr_teleop_node.py 中的坐标转换（VR 坐标系 → 机器人规划坐标系）
+
+**应用范围**：用于遥操作控制，将 VR 控制器的相对位姿转换为机器人规划坐标系（`fr3_link0`）中的位姿
+
+**输入数据**：来自 `/controller_data` 消息的 `rel_pose` 字段（保持 VR 原始坐标系）
+
+**坐标轴映射**：
+```
+VR 坐标系 → 机器人规划坐标系 (fr3_link0, ROS Z-up)
+─────────────────────────────────────────────────────
+位置映射：
+  robot.x ← VR.z (后→前)
+  robot.y ← -VR.x (右→左)
+  robot.z ← VR.y (上→上)
+
+旋转映射（通过旋转向量）：
+  robot.x ← -VR.z
+  robot.y ← VR.x
+  robot.z ← VR.y
+```
+
+**实现代码**（`fr3_vr_teleop_node.py` 的 `process_motion_pose_servo()` 函数）：
+```python
+# === 计算 VR 相对变化 ===
+vr_anchor_pi, vr_anchor_qi = pose_inverse(self.vr_anchor_p, self.vr_anchor_q)
+dvr_p, dvr_q = pose_compose(vr_anchor_pi, vr_anchor_qi, vr_p_now, vr_q_now)
+
+# === 坐标轴映射：VR → Robot Planning Frame ===
+# VR: [x=右, y=上, z=后]  -> robot planning_frame
+dp_robot = np.array([
+    dvr_p[2],    # robot.x ← VR.z (后→前)
+    -dvr_p[0],   # robot.y ← -VR.x (右→左)
+    dvr_p[1],    # robot.z ← VR.y (上→上)
+], dtype=float)
+
+# === 旋转映射：VR → Robot Planning Frame ===
+rotvec_raw = R.from_quat(dvr_q).as_rotvec()  # [rx, ry, rz] in VR frame
+rotvec_robot = np.array([
+    -rotvec_raw[2],  # robot.x ← -VR.z
+    rotvec_raw[0],   # robot.y ← VR.x
+    rotvec_raw[1],   # robot.z ← VR.y
+], dtype=float)
+
+# 将旋转向量转回四元数
+dR_robot = R.from_rotvec(rotvec_robot)
+dq_robot = quat_normalize(dR_robot.as_quat())
+
+# === 应用到机器人末端执行器 ===
+p_des, q_des = pose_compose(self.ee_anchor_p, self.ee_anchor_q, dp_robot, dq_robot)
+```
+
+**坐标转换流程**：
+1. 从 `/controller_data` 消息的 `rel_pose` 字段获取 VR 控制器的相对位姿（VR 原始坐标系）
+2. 计算 VR 控制器相对于锚点的变化量：`ΔT_vr = T_vr_anchor^-1 ⊗ T_vr_now`
+3. 通过坐标轴映射将 VR 坐标系转换为机器人规划坐标系（ROS Z-up）
+4. 将转换后的位姿变化应用到机器人末端执行器锚点：`T_des = T_ee_anchor ⊗ ΔT_robot`
+5. 计算当前位姿与期望位姿的误差，生成速度控制指令
+
+**说明**：机器人规划坐标系（`fr3_link0`）遵循 ROS 标准，为 Z-up 坐标系，与 ROS 坐标系一致。
 
 ### 位姿计算
 
@@ -265,16 +380,8 @@ VR 控制器数据通过以下流程传递：
 - **平滑滤波**：使用低通滤波器平滑速度指令
 - **死区处理**：小误差时不输出指令，避免抖动
 
-## 📝 开发状态
 
-### 已完成功能
 
-- [x] VR 控制器数据获取
-- [x] 绝对和相对位姿发布
-- [x] 双控制器支持
-- [x] 机器人遥操作控制
-- [x] 夹爪连续控制
-- [x] 坐标系统转换
-- [x] 平滑控制和平滑停止
+
 
 
